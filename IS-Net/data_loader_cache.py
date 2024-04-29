@@ -42,7 +42,7 @@ def get_im_gt_name_dict(datasets, flag='valid'):
             print('-gt-', datasets[i]["name"],datasets[i]["gt_dir"], ': ',len(tmp_gt_list))
 
 
-        if flag=="train": ## combine multiple training sets into one dataset
+        if False and flag=="train": ## combine multiple training sets into one dataset
             if len(name_im_gt_list)==0:
                 name_im_gt_list.append({"dataset_name":datasets[i]["name"],
                                         "im_path":tmp_im_list,
@@ -70,7 +70,7 @@ def get_im_gt_name_dict(datasets, flag='valid'):
 
     return name_im_gt_list
 
-def create_dataloaders(name_im_gt_list, cache_size=[], cache_boost=True, my_transforms=[], batch_size=1, shuffle=False):
+def create_dataloaders(name_im_gt_list, cache_size=[], cache_boost=True, my_transforms=[], batch_size=1, shuffle=False, flag='train'):
     ## model="train": return one dataloader for training
     ## model="valid": return a list of dataloaders for validation or testing
 
@@ -88,14 +88,31 @@ def create_dataloaders(name_im_gt_list, cache_size=[], cache_boost=True, my_tran
     if(batch_size>8):
         num_workers_ = 8
 
+    if flag == 'train':
+        res_ds = None
+    
     for i in range(0,len(name_im_gt_list)):
         gos_dataset = GOSDatasetCache([name_im_gt_list[i]],
                                       cache_size = cache_size,
                                       cache_path = name_im_gt_list[i]["cache_dir"],
                                       cache_boost = cache_boost,
                                       transform = transforms.Compose(my_transforms))
-        gos_dataloaders.append(DataLoader(gos_dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers_))
-        gos_datasets.append(gos_dataset)
+        if flag == 'train':
+            if res_ds is None:
+                res_ds = gos_dataset
+            else:
+                res_ds = res_ds + gos_dataset
+        else:
+            gos_dataloaders.append(DataLoader(gos_dataset, batch_size=batch_size,
+                                              shuffle=shuffle, num_workers=num_workers_))
+            gos_datasets.append(gos_dataset)
+    
+    if flag == 'train':
+        gos_dataset = res_ds
+        gos_datasets = [gos_dataset]
+        gos_dataloaders = [DataLoader(gos_dataset, batch_size=batch_size,
+                                      shuffle=shuffle, num_workers=num_workers_)]
+    
 
     return gos_dataloaders, gos_datasets
 
@@ -255,6 +272,9 @@ class GOSDatasetCache(Dataset):
         self.dataset["gts_pt_dir"] = ""
 
         self.dataset = self.manage_cache(dataset_names)
+        # self.dataset["cache_path"] = cache_path_list
+        self.sizes = [len(self.dataset["im_path"])]
+        self.cache_paths = [cache_path]
 
     def manage_cache(self,dataset_names):
         if not os.path.exists(self.cache_path): # create the folder for cache
@@ -275,7 +295,7 @@ class GOSDatasetCache(Dataset):
         for i, im_path in tqdm(enumerate(self.dataset["im_path"]), total=len(self.dataset["im_path"])):
 
             im_id = cached_dataset["im_name"][i]
-            print("im_path: ", im_path)
+            # print("im_path: ", im_path)
             im = im_reader(im_path)
             im, im_shp = im_preprocess(im,self.cache_size)
             im_cache_file = os.path.join(cache_folder,self.dataset["data_name"][i]+"_"+im_id + "_im.pt")
@@ -341,6 +361,37 @@ class GOSDatasetCache(Dataset):
 
     def __len__(self):
         return len(self.dataset["im_path"])
+    
+    def __add__(self, other):
+        new_dataset = deepcopy(self)
+        # new_dataset.ims_pt += other.ims_pt
+        # new_dataset.gts_pt += other.gts_pt
+        new_dataset.dataset["data_name"] = new_dataset.dataset["data_name"] + other.dataset["data_name"]
+        new_dataset.dataset["im_name"] = new_dataset.dataset["im_name"] + other.dataset["im_name"]
+        new_dataset.dataset["im_path"] = new_dataset.dataset["im_path"] + other.dataset["im_path"]
+        new_dataset.dataset["ori_im_path"] = new_dataset.dataset["ori_im_path"] + other.dataset["ori_im_path"]
+        new_dataset.dataset["gt_path"] = new_dataset.dataset["gt_path"] + other.dataset["gt_path"]
+        new_dataset.dataset["ori_gt_path"] = new_dataset.dataset["ori_gt_path"] + other.dataset["ori_gt_path"]
+        if new_dataset.dataset["im_shp"]:
+            new_dataset.dataset["im_shp"] = new_dataset.dataset["im_shp"] + other.dataset["im_shp"]
+            new_dataset.dataset["gt_shp"] = new_dataset.dataset["gt_shp"] + other.dataset["gt_shp"]
+        # assert new_dataset.dataset["im_ext"] == other.dataset["im_ext"], f'{new_dataset.dataset["im_ext"]} != {other.dataset["im_ext"]}'
+        # assert new_dataset.dataset["gt_ext"] == other.dataset["gt_ext"], f'{new_dataset.dataset["gt_ext"]} != {other.dataset["gt_ext"]}'
+        new_dataset.dataset["im_ext"] += other.dataset["im_ext"]
+        new_dataset.dataset["gt_ext"] += other.dataset["gt_ext"]
+        new_dataset.sizes += other.sizes
+        new_dataset.cache_paths += other.cache_paths
+        return new_dataset
+    
+    @staticmethod
+    def get_catch_idx(idx, cache_sizes):
+        total = 0
+        for i, size in enumerate(cache_sizes):
+            if total + size > idx:
+                return i
+            total += size
+        raise 'could not find cache idx'
+            
 
     def __getitem__(self, idx):
 
@@ -354,12 +405,17 @@ class GOSDatasetCache(Dataset):
             # print(idx, 'time for pt loading: ', time.time()-start)
 
         else:
+            # return idx//cache_size[0], idx%cache_size[0]
+            
+            cache_idx = self.get_catch_idx(idx, self.sizes)
+            cache_path = self.cache_paths[cache_idx]
             # import time
             # start = time.time()
             # print("tensor***")
-            im_pt_path = os.path.join(self.cache_path,os.sep.join(self.dataset["im_path"][idx].split(os.sep)[-2:]))
+            dir_and_name = self.dataset["im_path"][idx].split(os.sep)[-2:]
+            im_pt_path = os.path.join(cache_path,os.sep.join(self.dataset["im_path"][idx].split(os.sep)[-2:]))
             im = torch.load(im_pt_path)#(self.dataset["im_path"][idx])
-            gt_pt_path = os.path.join(self.cache_path,os.sep.join(self.dataset["gt_path"][idx].split(os.sep)[-2:]))
+            gt_pt_path = os.path.join(cache_path,os.sep.join(self.dataset["gt_path"][idx].split(os.sep)[-2:]))
             gt = torch.load(gt_pt_path)#(self.dataset["gt_path"][idx])
             # print(idx,'time for tensor loading: ', time.time()-start)
 
@@ -377,6 +433,7 @@ class GOSDatasetCache(Dataset):
         "image": im,
         "label": gt,
         "shape": torch.from_numpy(np.array(im_shp)),
+        "dir_and_name": dir_and_name,
         }
 
         if self.transform:
